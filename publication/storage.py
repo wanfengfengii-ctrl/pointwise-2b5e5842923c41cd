@@ -100,6 +100,10 @@ def initialize_warehouse(warehouse: sqlite3.Connection) -> None:
     except BaseException:
         warehouse.rollback()
         raise
+    # The bottle ledger references fixed fact rows and is part of the same
+    # warehouse, so it is created here and stays readable without the catalog.
+    from bottling.storage import initialize_bottling
+    initialize_bottling(warehouse)
 
 
 @contextmanager

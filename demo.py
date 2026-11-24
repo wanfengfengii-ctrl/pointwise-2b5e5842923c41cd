@@ -7,6 +7,16 @@ from tempfile import TemporaryDirectory
 from account.day import read_day, read_day_snapshot
 from account.reconcile import reconcile_day
 from archive.retrieve import claim
+from bottling import (
+    AdmittedRowSource,
+    BottlePortionSource,
+    EvidenceMismatch,
+    NewBottle,
+    SourceUnavailable,
+    read_bottle,
+    read_original_row,
+    split,
+)
 from catalog.lifecycle import PointStatus
 from catalog.registry import initialize_catalog, open_catalog, register
 from catalog.retirement import retire
@@ -154,11 +164,139 @@ def admission_first(root, sample):
               'Two admitted rows contribute 5 + 7 mL. The sample fixes source line 17 for F.')
 
 
+def bottling_night(root, sample):
+    """Split and combine bottles, then audit them after the directory goes away."""
+    point_id = sample['bottling_point_id']
+    device_id = sample['bottling_device_id']
+    business_day = sample['business_day']
+    with databases(root, create=True) as (catalog, warehouse):
+        register(catalog, point_id, device_id)
+        rows = lambda group: [SourceRow(device_id, **entry) for entry in sample['bottling'][group]]
+        left = stage(catalog, warehouse, 'left', point_id, business_day, rows('left'))
+        right = stage(catalog, warehouse, 'right', point_id, business_day, rows('right'))
+        shared = stage(catalog, warehouse, 'shared', point_id, business_day, rows('shared'))
+        left_receipt = seal(catalog, warehouse, left.request_id, left.batch_id)
+        right_receipt = seal(catalog, warehouse, right.request_id, right.batch_id)
+        shared_receipt = seal(catalog, warehouse, shared.request_id, shared.batch_id)
+
+        # Same 10 mL on the same line, but the second receipt keeps its own stock.
+        split(warehouse, 'draw-left', (
+            NewBottle('A', (AdmittedRowSource(left_receipt.receipt_id, device_id, 4, 6),)),
+        ))
+        left_row = read_original_row(warehouse, left_receipt.receipt_id, device_id, 4)
+        right_row = read_original_row(warehouse, right_receipt.receipt_id, device_id, 4)
+
+        # One original row enters two bottles, then the two paths are merged.
+        split(warehouse, 'split-shared', (
+            NewBottle('R1', (AdmittedRowSource(shared_receipt.receipt_id, device_id, 4, 60),)),
+            NewBottle('R2', (AdmittedRowSource(shared_receipt.receipt_id, device_id, 4, 40),)),
+        ))
+        merged = split(warehouse, 'merge', (NewBottle('C', (
+            BottlePortionSource('R1', 0, 30),
+            BottlePortionSource('R2', 0, 20),
+        )),))
+
+        # A request whose second output overdraws issues nothing at all.
+        failed = False
+        try:
+            split(warehouse, 'overdraw', (
+                NewBottle('NEVER', (BottlePortionSource('C', 0, 10),)),
+                NewBottle('TOO-MUCH', (BottlePortionSource('C', 0, 60),)),
+            ))
+        except SourceUnavailable:
+            failed = True
+
+        # A same-volume replacement receipt must not be accepted as the binding.
+        substituted = False
+        try:
+            split(warehouse, 'wrong-receipt', (
+                NewBottle('WRONG', (AdmittedRowSource(left_receipt.receipt_id, device_id, 4, 11),)),
+            ))
+        except SourceUnavailable:
+            substituted = True
+
+        pre_offline = read_bottle(warehouse, 'C')
+        expected_evidence = [
+            [portion.receipt_id, list(portion.path), portion.issued_ml, portion.remaining_ml]
+            for portion in pre_offline.portions
+        ]
+
+    (root / 'catalog.sqlite3').rename(root / 'catalog.offline')
+    with closing(open_warehouse(root / 'warehouse.sqlite3')) as warehouse:
+        online = read_bottle(warehouse, 'C')
+        never = warehouse.execute("SELECT 1 FROM bottles WHERE bottle_id = 'NEVER'").fetchone()
+        split(warehouse, 'offline-more', (
+            NewBottle('D', (BottlePortionSource('C', 1, 5),)),
+        ))
+        downstream = read_bottle(warehouse, 'C')
+        moved = read_bottle(warehouse, 'D')
+        left_after = read_original_row(warehouse, left_receipt.receipt_id, device_id, 4)
+        evidence = [[portion.receipt_id, list(portion.path), portion.issued_ml, portion.remaining_ml]
+                    for portion in online.portions]
+        scene('v9', {'point_id': point_id, 'same_volume_receipts': 2, 'shared_ml': 100},
+              {'left': [10, 6], 'right': [10, 0], 'merge': 50},
+              {'left': [left_row.original_ml, left_row.drawn_ml],
+               'right': [right_row.original_ml, right_row.drawn_ml],
+               'merge': merged.bottles[0].total_ml},
+              {'evidence': expected_evidence,
+               'failed_clean': True, 'never_issued': True, 'substituted_refused': True,
+               'offline_c': 45, 'offline_d': 5, 'left_remaining': 4},
+              {'evidence': evidence, 'failed_clean': failed and never is None,
+               'never_issued': never is None, 'substituted_refused': substituted,
+               'offline_c': downstream.remaining_ml, 'offline_d': moved.remaining_ml,
+               'left_remaining': left_after.remaining_ml},
+              ['bottling/service.py', 'bottling/authority.py', 'bottling/accounts.py',
+               'bottling/ledger.py', 'archive/retrieve.py'],
+              'Two equal 10 mL rows stay separate; one row entering R1 and R2 merges as two '
+              'distinct paths; the overdrawing request leaves every balance intact; after the '
+              'directory is moved the remaining volumes and hand-off segments still audit.')
+
+
+def bottling_evidence(root, sample):
+    """Show that a changed original row is reported, not silently replaced."""
+    point_id = sample['bottling_point_id']
+    device_id = sample['bottling_device_id']
+    business_day = sample['business_day']
+    with databases(root, create=True) as (catalog, warehouse):
+        register(catalog, point_id, device_id)
+        rows = [SourceRow(device_id, **entry) for entry in sample['bottling']['left']]
+        batch = stage(catalog, warehouse, 'evidence', point_id, business_day, rows)
+        receipt = seal(catalog, warehouse, batch.request_id, batch.batch_id)
+        split(warehouse, 'bind', (
+            NewBottle('B', (AdmittedRowSource(receipt.receipt_id, device_id, 4, 4),)),
+        ))
+        warehouse.execute(
+            'UPDATE archive_rows SET raw_value = ? WHERE batch_id = ? AND ordinal = 0',
+            ('0x63', receipt.batch_id),
+        )
+        blocked = False
+        try:
+            split(warehouse, 'later', (NewBottle('C', (BottlePortionSource('B', 0, 1),)),))
+        except EvidenceMismatch:
+            blocked = True
+        account = read_bottle(warehouse, 'B')
+
+    scene('v10', {'receipt': receipt.receipt_id, 'row': [device_id, 4], 'tampered_to': 99},
+          {'issues': 1, 'reason': 'archive_integrity', 'remaining': 4, 'blocked': True},
+          {'issues': len(account.issues),
+           'reason': account.issues[0].reason if account.issues else None,
+           'remaining': account.remaining_ml, 'blocked': blocked},
+          {'source': "bottle 'B' portion 0", 'detail_mentions_receipt': True},
+          {'source': account.issues[0].source if account.issues else None,
+           'detail_mentions_receipt': bool(account.issues)
+           and receipt.receipt_id in account.issues[0].detail},
+          ['bottling/accounts.py', 'bottling/authority.py', 'bottling/ledger.py'],
+          'The changed archived row is reported against the exact bottle portion and blocks '
+          'further splitting without touching the stored remainder.')
+
+
 def run(root):
     sample = json.loads(Path(__file__).with_name('sample.json').read_text(encoding='utf-8'))
     mixed_day(root / 'mixed-day', sample)
     retirement_first(root / 'retirement-first', sample)
     admission_first(root / 'admission-first', sample)
+    bottling_night(root / 'bottling-night', sample)
+    bottling_evidence(root / 'bottling-evidence', sample)
 
 
 def main():

@@ -8,5 +8,12 @@
     {"line_number": 20, "value": null, "unit": "mL", "missing": true}
   ],
   "original": [{"line_number": 4, "value": 5, "unit": "mL"}],
-  "followup": [{"line_number": 17, "value": 7, "unit": "mL"}]
+  "followup": [{"line_number": 17, "value": 7, "unit": "mL"}],
+  "bottling_point_id": "Q",
+  "bottling_device_id": "device-q",
+  "bottling": {
+    "left": [{"line_number": 4, "value": 10, "unit": "mL"}],
+    "right": [{"line_number": 4, "value": 10, "unit": "mL"}],
+    "shared": [{"line_number": 4, "value": 100, "unit": "mL"}]
+  }
 }
